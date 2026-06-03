@@ -11,28 +11,89 @@ import base64
 import io
 import json
 import os
+import platform as _platform
 import re
+import shutil
 from datetime import datetime
+from typing import Optional
 
 import pdfplumber
 import requests
 from dateutil import parser as dateparser
 
-# ── Optional: OCR stack ───────────────────────────────────────────────────────
+
+# ── Cross-platform path detection ─────────────────────────────────────────────
+def _find_tesseract() -> Optional[str]:
+    """Return Tesseract executable path for this system."""
+    env = os.getenv('TESSERACT_CMD')
+    if env and os.path.isfile(env):
+        return env
+    in_path = shutil.which('tesseract')
+    if in_path:
+        return in_path
+    if _platform.system() == 'Windows':
+        for p in [
+            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+            r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        ]:
+            if os.path.isfile(p):
+                return p
+    return None
+
+
+def _find_poppler() -> Optional[str]:
+    """Return Poppler bin directory, or None if it is already on PATH."""
+    env = os.getenv('POPPLER_PATH')
+    if env and os.path.isdir(env):
+        return env
+    if shutil.which('pdftoppm'):
+        return None  # already on PATH (Linux/Mac or Windows with PATH configured)
+    if _platform.system() == 'Windows':
+        home = os.path.expanduser('~')
+        for base in [os.path.join(home, 'Downloads'), r"C:\Program Files",
+                     r"C:\Program Files (x86)", r"C:\tools"]:
+            if not os.path.isdir(base):
+                continue
+            for name in os.listdir(base):
+                for tail in [os.path.join('Library', 'bin'), 'bin']:
+                    candidate = os.path.join(base, name, tail)
+                    if os.path.isfile(os.path.join(candidate, 'pdftoppm.exe')):
+                        return candidate
+                    # one level deeper (e.g. release-folder/poppler-x.y/Library/bin)
+                    inner = os.path.join(base, name)
+                    if os.path.isdir(inner):
+                        for sub in os.listdir(inner):
+                            c2 = os.path.join(inner, sub, tail)
+                            if os.path.isfile(os.path.join(c2, 'pdftoppm.exe')):
+                                return c2
+    return None
+
+
+# ── Optional: pdf2image + PIL (needed for Gemini image conversion) ────────────
 try:
-    import pytesseract
     from pdf2image import convert_from_path
     from PIL import ImageEnhance, ImageFilter, Image
-    pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-    POPPLER_PATH = r"C:\Users\golla\Downloads\Release-26.02.0-0\poppler-26.02.0\Library\bin"
-    OCR_AVAILABLE = True
+    POPPLER_PATH = _find_poppler()
+    PDF2IMAGE_AVAILABLE = True
+except Exception:
+    PDF2IMAGE_AVAILABLE = False
+    POPPLER_PATH = None
+
+# ── Optional: Tesseract OCR (needed for OCR fallback) ────────────────────────
+try:
+    import pytesseract
+    _tess = _find_tesseract()
+    if _tess:
+        pytesseract.pytesseract.tesseract_cmd = _tess
+    OCR_AVAILABLE = PDF2IMAGE_AVAILABLE  # OCR needs both pytesseract and pdf2image
 except Exception:
     OCR_AVAILABLE = False
 
-# SSL: disabled because local VPN/proxy intercepts HTTPS with a private CA
-_SSL_VERIFY = False
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# ── SSL verification (disable via DISABLE_SSL_VERIFY=true in .env for VPN/proxy)
+_SSL_VERIFY = os.getenv('DISABLE_SSL_VERIFY', '').lower() not in ('1', 'true', 'yes')
+if not _SSL_VERIFY:
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 GEMINI_AVAILABLE = True
 _GEMINI_URL = (
@@ -243,7 +304,7 @@ def _detect_form_type(pdf_path: str) -> str:
 
 # ── Gemini extraction ─────────────────────────────────────────────────────────
 def _gemini_extract(pdf_path: str, api_key: str):
-    if not (api_key and OCR_AVAILABLE):
+    if not (api_key and PDF2IMAGE_AVAILABLE):
         return None
     try:
         imgs = convert_from_path(pdf_path, dpi=250, poppler_path=POPPLER_PATH)
@@ -342,7 +403,7 @@ def _ocr_tags(img) -> str:
     return "\n".join(results)
 
 
-def _ocr_word_lines(img, config: str) -> list[str]:
+def _ocr_word_lines(img, config: str) -> list:
     """Return OCR text grouped into lines by word y-position.
     Adjacent words on the same row are concatenated without a separator,
     which reconstructs tags that OCR splits into multiple word tokens.
@@ -385,7 +446,7 @@ def _ocr_word_lines(img, config: str) -> list[str]:
 
 # ── Item finding ──────────────────────────────────────────────────────────────
 def _find_items_in_text(text: str, form_type: str, seen: set,
-                         known_drawings: set | None = None) -> list:
+                         known_drawings: Optional[set] = None) -> list:
     # Rejoin tags split across lines by OCR (e.g. "141-HO-0091/191-\nS35")
     text = re.sub(r'-[ \t]*\n[ \t]*', '-', text)
     found = []
@@ -519,13 +580,18 @@ def _ocr_fallback(pdf_path: str):
     items: list = []
     full_text = ""
 
+    _empty_meta = {k: "" for k in (
+        "report_no", "noi_no", "issue_date",
+        "ccsjv_name", "ccsjv_date", "client_name", "client_date",
+    )}
+
     if not OCR_AVAILABLE:
-        return [], {}
+        return [], _empty_meta
 
     try:
         imgs = convert_from_path(pdf_path, dpi=300, poppler_path=POPPLER_PATH)
     except Exception:
-        return [], {}
+        return [], _empty_meta
 
     # ── Step 1: OCR all pages ────────────────────────────────────────────────
     page_std_texts: list = []    # standard OCR (reliable, for metadata + known_drawings)
@@ -907,3 +973,4 @@ def process_pdf(pdf_path: str, api_key: str = "") -> tuple:
         })
 
     return rows, status, None
+
